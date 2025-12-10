@@ -15,7 +15,7 @@ pip install -r requirements.txt
 
 Run the following command to test our LAFusion network. Results are saved in the `[result_dir]` folder.
 ```
-python inference_LAFusion.py -i [wide_dir] -o [result_dir]
+python inference_LAF.py -i [wide_dir] -o [result_dir]
 ```
 
 ## data
