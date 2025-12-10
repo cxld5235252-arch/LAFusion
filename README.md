@@ -1,9 +1,28 @@
-训练用main.py，CUDA_VISIBLE_DEVICES=1 python main.py --cfg_path ./configs/ref_sr.yaml
-测试用inference_resshift.py。 python inference_resshift.py -i [wide_dir] -o [result_dir]
-编解码和diffusion相关的东西主要在/models/gaussian_diffusion.py
+# ReWiTe: Realistic Wide-angle and Telephoto Dual Camera Fusion Dataset and Loosely Alignement Based Fusion
 
-数据位置：
-gt_root: /home/zkyd/cxl/code/paper/Resshift_0902/data_new_gt_0925/train/gt_y_128
-lq_root: /home/zkyd/cxl/code/paper/Resshift_0902/data_new_gt_0925/train/wide_y_128
-tele_root: /home/zkyd/cxl/code/paper/Resshift_0902/data_new_gt_0925/train/ref_y_128
+## Environment Setup
+
+To set up your environment, follow these steps:
+
+```
+conda create -n my_env python=3.8 -y
+conda activate my_env
+conda install pytorch==1.10.1 torchvision==0.11.2 cudatoolkit=11.1 -c pytorch -y
+pip install -r requirements.txt
+```
+
+## Test our LAFusion network
+
+Run the following command to test our LAFusion network. Results are saved in the `[result_dir]` folder.
+```
+python inference_LAFusion.py -i [wide_dir] -o [result_dir]
+```
+
+## data
+Prepare data.
+```
+gt_root: LAFusion/data_new_gt_0925/train/gt_y_128
+lq_root: LAFusion/data_new_gt_0925/train/wide_y_128
+tele_root: LAFusion/data_new_gt_0925/train/ref_y_128
+```
 
