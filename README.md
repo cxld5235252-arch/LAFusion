@@ -19,9 +19,11 @@ CUDA_VISIBLE_DEVICES=0 python inference_LAFusion.py -i ./data/wide_tile -o [resu
 ```
 
 ## Merge tile to full result
-'''
+```
 python /data/cxl/cxl_oppo/github/LGSR/merge_tile.py
-'''
+```
 
 ## Visualize the result 
+![Fusion Result](https://github.com/cxld5235252-arch/LAFusion/blob/main/result/284_wide.png)
+
 
