@@ -12,7 +12,7 @@ pip install -r requirements.txt
 ```
 
 ## Download ckeckpoint.
-Download the checkpoint file, the move them to './ckpt' folder.[LAFusion1](https://drive.google.com/file/d/1WQKneYSbfBrAmRR-q0FSZbmqQ4bnoSuh/view?usp=drive_link) [Other](https://drive.google.com/file/d/1x0xznXFFw94_-EINN0TdTI2ZDyxsbNNW/view?usp=sharing)
+Download the checkpoint file, the move them to './ckpt' folder.[LAFusion](https://drive.google.com/file/d/1WQKneYSbfBrAmRR-q0FSZbmqQ4bnoSuh/view?usp=drive_link) [Other](https://drive.google.com/file/d/1x0xznXFFw94_-EINN0TdTI2ZDyxsbNNW/view?usp=sharing)
 
 
 
