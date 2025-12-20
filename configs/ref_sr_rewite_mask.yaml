@@ -4,8 +4,8 @@ trainer:
 model:
   target: models.unet.UNetModelSwin
   # ckpt_path: /home/zkyd/cxl/code/paper/Resshift_vqgan_origin_mask/save_dir/full_mask/ckpts/unet_model.pth
-  # ckpt_path: /home/zkyd/cxl/cxl_oppo/Resshift_vqgan_origin_mask/cf_rewite_all/2025-03-11-05-32/ckpts/unet_model.pth
-  ckpt_path: /data/cxl/cxl_oppo/res/train_logs/stride_1_cf/2024-11-29-14-23/ckpts/unet_model.pth
+  # ckpt_path: /data/cxl/code/Resshift_vqgan_origin_mask/save_dir/2025-06-08-02-22/ckpts/unet_model.pth
+  ckpt_path: ./ckpt/unet_model.pth
   params:
     image_size: 128
     in_channels: 3
@@ -102,10 +102,14 @@ data:
   train:
     type: realesrganmask
     params:
-      gt_root: /home/zkyd/cxl/cxl_oppo/Resshift_vqgan_origin_mask/data/cf_rewite/gt_128
-      lq_root: /home/zkyd/cxl/cxl_oppo/Resshift_vqgan_origin_mask/data/cf_rewite/wide_128
-      tele_root: /home/zkyd/cxl/cxl_oppo/Resshift_vqgan_origin_mask/data/cf_rewite/ref_128
-      mask_root: /home/zkyd/cxl/cxl_oppo/Resshift_vqgan_origin_mask/data/cf_rewite/occ_128
+      # gt_root: /data/datasets/cxl/oppo_datasets/data_rewite_tele_warp_0118/outer/train/gt_128
+      # lq_root: /data/datasets/cxl/oppo_datasets/data_rewite_tele_warp_0118/outer/train/wide_128
+      # tele_root: /data/datasets/cxl/oppo_datasets/data_rewite_tele_warp_0118/outer/train/tele_new_128
+      # mask_root: /data/datasets/cxl/oppo_datasets/data_rewite_tele_warp_0118/outer/train/occ_128
+      gt_root: /data/cxl/two/test/tmp/gt_128
+      lq_root: /data/cxl/two/test/tmp/wide_128
+      tele_root: /data/cxl/two/test/tmp/result_tele_fusion_128
+      mask_root: /data/cxl/two/test/tmp/occ_128
       dir_paths: []
       txt_file_path: [
                       '/mnt/sfs-common/zsyue/database/ImageNet/files_txt/path_train_all.txt', 
@@ -136,20 +140,19 @@ data:
       # crop_pad_size: 300
       use_hflip: True
       use_rot: False
-      rescale_gt: True
+      rescale_gt: False
   val:
     type: base
     params:
-      # dir_path: /data/datasets/cxl/oppo_datasets/data_oppo72/wide_1024
-      # extra_dir_path: /data/datasets/cxl/oppo_datasets/data_oppo72/tele_1024
-      # mask_dir_path: /data/datasets/cxl/oppo_datasets/data_oppo72/occ_1024
+      # dir_path: /data/cxl/two/train/wide_1024
+      # extra_dir_path: /data/cxl/two/train/ref_1024
+      # mask_dir_path: /data/cxl/two/train/occ_1024
       # dir_path: /data/datasets/cxl/oppo_datasets/data_rewite_fusion_laplacian/color_1/test/wide_1024
-      # extra_dir_path: /data/datasets/cxl/oppo_datasets/data_rewite_fusion_laplacian/color_1/test/tele_warp_box40_fusion_1024
+      # extra_dir_path: /data/datasets/cxl/oppo_datasets/data_rewite_fusion_laplacian/color_1/test/tele_warp_box5_fusion_1024
       # mask_dir_path: /data/datasets/cxl/oppo_datasets/data_rewite_fusion_laplacian/color_1/test/occ_1024
-      dir_path: /data/cxl/yinpan/cxl/data/rewite_ssl_test/wide_1024
-      extra_dir_path: /data/cxl/yinpan/cxl/data/rewite_ssl_test/tele_warp_box40_fusion_1024
-      mask_dir_path: /data/cxl/yinpan/cxl/data/rewite_ssl_test/occ_1024
-
+      dir_path: ./data/wide_tile
+      extra_dir_path: ./data/tele_tile
+      mask_dir_path: ./data/mask_tile
 
 
 train:
@@ -168,7 +171,7 @@ train:
   iterations: 3000000            # total iterations
   # save logging
   save_freq: 100             
-  log_freq: [2, 200, 1]         # [training loss, training images, val images]
+  log_freq: [2, 100, 1]         # [training loss, training images, val images]
   local_logging: True           # manually save images
   tf_logging: False             # tensorboard logging
   # validation settings

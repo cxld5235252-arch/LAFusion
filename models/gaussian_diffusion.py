@@ -2,14 +2,13 @@ import enum
 import math
 
 import torch
+import torch.nn as nn
 import numpy as np
 import torch as th
 import torch.nn.functional as F
-
+import torchvision,json
 from .basic_ops import mean_flat
-from .losses import normal_kl, discretized_gaussian_log_likelihood
 
-from ldm.models.autoencoder import AutoencoderKLTorch
 
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps, beta_start, beta_end):
     """
@@ -43,13 +42,7 @@ def get_named_eta_schedule(
     in the limit of num_diffusion_timesteps.
     """
     if schedule_name == 'exponential':
-        # ponential = kwargs.get('ponential', None)
-        # start = math.exp(math.log(min_noise_level / kappa) / ponential)
-        # end = math.exp(math.log(etas_end) / (2*ponential))
-        # xx = np.linspace(start, end, num_diffusion_timesteps, endpoint=True, dtype=np.float64)
-        # sqrt_etas = xx**ponential
         power = kwargs.get('power', None)
-        # etas_start = min(min_noise_level / kappa, min_noise_level, math.sqrt(0.001))
         etas_start = min(min_noise_level / kappa, min_noise_level)
         increaser = math.exp(1/(num_diffusion_timesteps-1)*math.log(etas_end/etas_start))
         base = np.ones([num_diffusion_timesteps, ]) * increaser
@@ -130,7 +123,9 @@ class GaussianDiffusion:
         scale_factor=None,
         normalize_input=True,
         latent_flag=True,
+        **kwargs
     ):
+
         self.kappa = kappa
         self.model_mean_type = model_mean_type
         self.loss_type = loss_type
@@ -207,6 +202,7 @@ class GaussianDiffusion:
             + _extract_into_tensor(self.sqrt_etas * self.kappa, t, x_start.shape) * noise
         )
 
+
     def q_posterior_mean_variance(self, x_start, x_t, t):
         """
         Compute the mean and variance of the diffusion posterior:
@@ -230,6 +226,84 @@ class GaussianDiffusion:
             == x_start.shape[0]
         )
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
+
+        
+    def p_mean_variance_in_train(
+        self, pred_zstart, model, x_t, y, t,
+        clip_denoised=True,
+        denoised_fn=None,
+        model_kwargs=None
+    ):
+        """
+        Apply the model to get p(x_{t-1} | x_t), as well as a prediction of
+        the initial x, x_0.
+
+        :param model: the model, which takes a signal and a batch of timesteps
+                      as input.
+        :param x_t: the [N x C x ...] tensor at time t.
+        :param y: the [N x C x ...] tensor of degraded inputs.
+        :param t: a 1-D Tensor of timesteps.
+        :param clip_denoised: if True, clip the denoised signal into [-1, 1].
+        :param denoised_fn: if not None, a function which applies to the
+            x_start prediction before it is used to sample. Applies before
+            clip_denoised.
+        :param model_kwargs: if not None, a dict of extra keyword arguments to
+            pass to the model. This can be used for conditioning.
+        :return: a dict with the following keys:
+                 - 'mean': the model mean output.
+                 - 'variance': the model variance output.
+                 - 'log_variance': the log of 'variance'.
+                 - 'pred_xstart': the prediction for x_0.
+        """
+        if model_kwargs is None:
+            model_kwargs = {}
+
+        B, C = x_t.shape[:2]
+        assert t.shape == (B,)
+
+        model_output = pred_zstart
+        
+        model_variance = _extract_into_tensor(self.posterior_variance, t, x_t.shape)
+        model_log_variance = _extract_into_tensor(self.posterior_log_variance_clipped, t, x_t.shape)
+
+        def process_xstart(x):                                                                                              
+            if denoised_fn is not None:
+                x = denoised_fn(x)
+            if clip_denoised:
+                return x.clamp(-1, 1)
+            return x
+
+        if self.model_mean_type == ModelMeanType.START_X:      # predict x_0
+            pred_xstart = process_xstart(model_output)
+        elif self.model_mean_type == ModelMeanType.RESIDUAL:      # predict x_0
+            pred_xstart = process_xstart(
+                self._predict_xstart_from_residual(y=y, residual=model_output)
+                )
+        elif self.model_mean_type == ModelMeanType.EPSILON:
+            pred_xstart = process_xstart(
+                self._predict_xstart_from_eps(x_t=x_t, y=y, t=t, eps=model_output)
+            )                                                  #  predict \eps
+        elif self.model_mean_type == ModelMeanType.EPSILON_SCALE:
+            pred_xstart = process_xstart(
+                self._predict_xstart_from_eps_scale(x_t=x_t, y=y, t=t, eps=model_output)
+            )                                                  #  predict \eps
+        else: 
+            raise ValueError(f'Unknown Mean type: {self.model_mean_type}')
+
+        model_mean, _, _ = self.q_posterior_mean_variance(
+            x_start=pred_xstart, x_t=x_t, t=t
+        )
+
+        assert (
+            model_mean.shape == model_log_variance.shape == pred_xstart.shape == x_t.shape
+        )
+        return {
+            "mean": model_mean,
+            "variance": model_variance,
+            "log_variance": model_log_variance,
+            "pred_xstart": pred_xstart,
+        }
+
 
     def p_mean_variance(
         self, model, x_t, y, t,
@@ -263,8 +337,9 @@ class GaussianDiffusion:
 
         B, C = x_t.shape[:2]
         assert t.shape == (B,)
+    
         model_output = model(self._scale_input(x_t, t), t, **model_kwargs)
-
+        
         model_variance = _extract_into_tensor(self.posterior_variance, t, x_t.shape)
         model_log_variance = _extract_into_tensor(self.posterior_log_variance_clipped, t, x_t.shape)
 
@@ -329,6 +404,27 @@ class GaussianDiffusion:
                 - _extract_into_tensor(self.etas, t, x_t.shape) * y
         ) / _extract_into_tensor(self.kappa * self.sqrt_etas, t, x_t.shape)
 
+    def p_sample_in_train(self, pred_zstart, model, x, y, t, clip_denoised=True, denoised_fn=None, model_kwargs=None, noise_repeat=False):
+        out = self.p_mean_variance_in_train(
+            pred_zstart,
+            model,
+            x,
+            y,
+            t,
+            clip_denoised=clip_denoised,
+            denoised_fn=denoised_fn,
+            model_kwargs=model_kwargs,
+        )
+
+        noise = th.randn_like(x)
+        if noise_repeat:
+            noise = noise[0,].repeat(x.shape[0], 1, 1, 1)
+        nonzero_mask = (
+            (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
+        )  # no noise when t == 0
+        sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
+        return {"sample": sample, "pred_xstart": out["pred_xstart"], "mean":out["mean"]}
+    
     def p_sample(self, model, x, y, t, clip_denoised=True, denoised_fn=None, model_kwargs=None, noise_repeat=False):
         """
         Sample x_{t-1} from the model at the given timestep.
@@ -355,6 +451,7 @@ class GaussianDiffusion:
             denoised_fn=denoised_fn,
             model_kwargs=model_kwargs,
         )
+
         noise = th.randn_like(x)
         if noise_repeat:
             noise = noise[0,].repeat(x.shape[0], 1, 1, 1)
@@ -396,7 +493,8 @@ class GaussianDiffusion:
         :param progress: if True, show a tqdm progress bar.
         :return: a non-differentiable batch of samples.
         """
-        final = None
+        
+
         for sample in self.p_sample_loop_progressive(
             y,
             model,
@@ -409,12 +507,12 @@ class GaussianDiffusion:
             device=device,
             progress=progress,
         ):
-            final = sample["sample"]
+            final = sample["pred_xstart"]
         with th.no_grad():
             out = self.decode_first_stage(
                     final,
                     first_stage_model=first_stage_model,
-                    consistencydecoder=consistencydecoder,
+                    
                     )
         return out
 
@@ -439,22 +537,21 @@ class GaussianDiffusion:
         """
         if device is None:
             device = next(model.parameters()).device
-        z_y = self.encode_first_stage(y, first_stage_model, up_sample=True)
+        z_y = self.encode_first_stage(y, first_stage_model, up_sample=False)
 
-        # generating noise
         if noise is None:
             noise = th.randn_like(z_y)
         if noise_repeat:
             noise = noise[0,].repeat(z_y.shape[0], 1, 1, 1)
         z_sample = self.prior_sample(z_y, noise)
-
+        
         indices = list(range(self.num_timesteps))[::-1]
         if progress:
             # Lazy import so that we don't depend on tqdm.
             from tqdm.auto import tqdm
 
             indices = tqdm(indices)
-
+        
         for i in indices:
             t = th.tensor([i] * y.shape[0], device=device)
             with th.no_grad():
@@ -472,6 +569,8 @@ class GaussianDiffusion:
                 z_sample = out["sample"]
 
     def decode_first_stage(self, z_sample, first_stage_model=None, consistencydecoder=None):
+        if first_stage_model == None:
+            return z_sample
         batch_size = z_sample.shape[0]
         data_dtype = z_sample.dtype
 
@@ -507,9 +606,26 @@ class GaussianDiffusion:
         else:
             if not model_dtype == data_dtype:
                 y = y.type(model_dtype)
-            with th.no_grad():
-                z_y = first_stage_model.encode(y)
-                out = z_y * self.scale_factor
+
+            z_y = first_stage_model.encode(y)
+            out = z_y * self.scale_factor
+            if not model_dtype == data_dtype:
+                out = out.type(data_dtype)
+            return out
+
+    def encode_mae_first_stage(self, y, first_stage_model, up_sample=False):
+        data_dtype = y.dtype
+        model_dtype = next(first_stage_model.parameters()).dtype
+        if up_sample and self.sf != 1:
+            y = F.interpolate(y, scale_factor=self.sf, mode='bicubic')
+        if first_stage_model is None:
+            return y
+        else:
+            if not model_dtype == data_dtype:
+                y = y.type(model_dtype)
+
+            z_y = first_stage_model.encode(y)
+            out = z_y * self.scale_factor
             if not model_dtype == data_dtype:
                 out = out.type(data_dtype)
             return out
@@ -528,72 +644,107 @@ class GaussianDiffusion:
 
         return y + _extract_into_tensor(self.kappa * self.sqrt_etas, t, y.shape) * noise
 
+    def masked_l1_loss(self, target, prediction, mask):  
+        """  
+        计算两个张量之间的带掩码的L1损失。  
+    
+        参数:  
+        target (torch.Tensor): 真实值张量。  
+        prediction (torch.Tensor): 预测值张量。  
+        mask (torch.Tensor): 掩码张量，与target和prediction形状相同，值为1表示需要计算损失，值为0表示忽略。  
+    
+        返回:  
+        torch.Tensor: 带掩码的L1损失的平均值。  
+        """  
+        # 计算绝对值差  
+        abs_diff = torch.abs(target - prediction)
+        # print(mask)
+        # 应用掩码，将掩码为0的位置的损失设为0  
+        masked_abs_diff = abs_diff * mask  
+        
+        # 计算带掩码的元素的总数（避免除以0）  
+        valid_count = mask.sum().item()  
+        
+        # 检查是否有有效的元素（即掩码为1的元素）  
+        if valid_count == 0:  
+            # 如果没有有效的元素，返回0或者一个指定的值（例如torch.tensor(0.0)）  
+            # 这里我们选择返回0.0，但你也可以根据需求返回其他值  
+            return torch.tensor(0.0, dtype=masked_abs_diff.dtype, device=masked_abs_diff.device)  
+      
+        # 计算带掩码的L1损失的平均值  
+        masked_l1_loss = masked_abs_diff.sum() / valid_count  
+        
+        return masked_l1_loss
+
     def training_losses(
-            self, model, x_start, y, t,
-            first_stage_model=None,
-            model_kwargs=None,
-            noise=None,
-            ):
-        """
-        Compute training losses for a single timestep.
+        self, model, x_start, y, 
+        mask = None, 
+        first_stage_model=None,
+        model_kwargs=None
+        ):
+        # =============================================================================================================================
+        # 使用vqgan
+        # z_y = self.encode_first_stage(y,first_stage_model,up_sample=True)
+        # z_start = self.encode_first_stage(x_start,first_stage_model,up_sample=True)
+        # model_kwargs['lq'] = self.encode_first_stage(model_kwargs['lq'],first_stage_model,up_sample=True)
+        # model_kwargs['tele'] = self.encode_first_stage(model_kwargs['tele'],first_stage_model,up_sample=True)
+        # =============================================================================================================================
+        # =============================================================================================================================
+        # 不使用任何编码器
+        z_y = y
+        z_start = x_start
+        # =============================================================================================================================
 
-        :param model: the model to evaluate loss on.
-        :param first_stage_model: autoencoder model
-        :param x_start: the [N x C x ...] tensor of inputs.
-        :param y: the [N x C x ...] tensor of degraded inputs.
-        :param t: a batch of timestep indices.
-        :param model_kwargs: if not None, a dict of extra keyword arguments to
-            pass to the model. This can be used for conditioning.
-        :param noise: if specified, the specific Gaussian noise to try to remove.
-        :param up_sample_lq: Upsampling low-quality image before encoding
-        :return: a dict with the key "loss" containing a tensor of shape [N].
-                 Some mean or variance settings may also have other keys.
-        """
-        if model_kwargs is None:
-            model_kwargs = {}
-
-        z_y = self.encode_first_stage(y, first_stage_model, up_sample=True)
-        z_start = self.encode_first_stage(x_start, first_stage_model, up_sample=False)
-
-        if noise is None:
-            noise = th.randn_like(z_start)
-
-        z_t = self.q_sample(z_start, z_y, t, noise=noise)
+        batch_size = x_start.shape[0]
+        device = x_start.device
+        
 
         terms = {}
+        # joint train
+        # when t=2,指从t=2的时刻reverse一步,pred_zstart_2指从t=2预测出来的z_start
+        t2_batch = torch.randint(2, 3, size=(batch_size,), device=device)
+        noise2 = th.randn_like(z_start)
+        z_2 = self.prior_sample(z_y, noise= noise2)
+        target_2 = z_start
 
-        if self.loss_type == LossType.MSE or self.loss_type == LossType.WEIGHTED_MSE:
-            model_output = model(self._scale_input(z_t, t), t, **model_kwargs)
-            target = {
-                ModelMeanType.START_X: z_start,
-                ModelMeanType.RESIDUAL: z_y - z_start,
-                ModelMeanType.EPSILON: noise,
-                ModelMeanType.EPSILON_SCALE: noise*self.kappa*_extract_into_tensor(self.sqrt_etas, t, noise.shape),
-            }[self.model_mean_type]
-            assert model_output.shape == target.shape == z_start.shape
-            terms["mse"] = mean_flat((target - model_output) ** 2)
-            if self.model_mean_type == ModelMeanType.EPSILON_SCALE:
-                terms["mse"] /= (self.kappa**2 * _extract_into_tensor(self.etas, t, t.shape))
-            if self.loss_type == LossType.WEIGHTED_MSE:
-                weights = _extract_into_tensor(self.weight_loss_mse, t, t.shape)
-            else:
-                weights = 1
-            terms["mse"] *= weights
-        else:
-            raise NotImplementedError(self.loss_type)
+        
+        pred_zstart_2 = model(z_2, t2_batch, **model_kwargs)
+        
+        # when t=1,指从t=1的时刻reverse一步,pred_zstart_1指从t=1预测出来的z_start
+        t1_batch = torch.randint(1, 2, size=(batch_size,), device=device)
+        # sample z1 from z2,p(z1|z2,z_start)
+        z_1 = self.p_sample_in_train(pred_zstart_2, model, z_2, z_y, t2_batch, model_kwargs=model_kwargs)['sample']
+        target_1 = z_start
+        pred_zstart_1 = model(z_1, t1_batch, **model_kwargs)
+        
+        # when t=0
+        t0_batch = torch.randint(0, 1, size=(batch_size,), device=device)
+        noise0 = th.randn_like(z_start)
+        z_0 = self.p_sample_in_train(pred_zstart_1, model, z_1, z_y, t1_batch, model_kwargs=model_kwargs)['sample']
+        target_0 = z_start
+        pred_zstart_0 = model(z_0, t0_batch, **model_kwargs)
 
-        if self.model_mean_type == ModelMeanType.START_X:      # predict x_0
-            pred_zstart = model_output
-        elif self.model_mean_type == ModelMeanType.EPSILON:
-            pred_zstart = self._predict_xstart_from_eps(x_t=z_t, y=z_y, t=t, eps=model_output)
-        elif self.model_mean_type == ModelMeanType.RESIDUAL:
-            pred_zstart = self._predict_xstart_from_residual(y=z_y, residual=model_output)
-        elif self.model_mean_type == ModelMeanType.EPSILON_SCALE:
-            pred_zstart = self._predict_xstart_from_eps_scale(x_t=z_t, y=z_y, t=t, eps=model_output)
-        else:
-            raise NotImplementedError(self.model_mean_type)
+        # joint train loss
+        # loss_2 = mean_flat((target_2 - pred_zstart_2) ** 2)
+        # loss_1 = mean_flat((target_1 - pred_zstart_1) ** 2)
+        # loss_0 = mean_flat((target_0 - pred_zstart_0) ** 2)
+        # loss_2 = torch.nn.functional.l1_loss(target_2, pred_zstart_2, reduction='mean')
+        # loss_1 = torch.nn.functional.l1_loss(target_1, pred_zstart_1, reduction='mean')
+        # loss_0 = torch.nn.functional.l1_loss(target_0, pred_zstart_0, reduction='mean')
+        
+        # mask = 1.0 - mask
+        loss_2 = self.masked_l1_loss(target_2, pred_zstart_2, mask)
+        loss_1 = self.masked_l1_loss(target_1, pred_zstart_1, mask)
+        loss_0 = self.masked_l1_loss(target_0, pred_zstart_0, mask)
 
-        return terms, z_t, pred_zstart
+        terms["mse_2"] = loss_2
+        terms["mse_1"] = loss_1
+        terms["mse_0"] = loss_0
+        terms["mse"] = loss_2+loss_1+loss_0
+
+        return terms, x_start, pred_zstart_0
+    
+
 
     def _scale_input(self, inputs, t):
         if self.normalize_input:
@@ -607,632 +758,3 @@ class GaussianDiffusion:
         else:
             inputs_norm = inputs
         return inputs_norm
-
-class GaussianDiffusionDDPM:
-    """
-    Utilities for training and sampling diffusion models.
-
-    Ported directly from here, and then adapted over time to further experimentation.
-    https://github.com/hojonathanho/diffusion/blob/1e0dceb3b3495bbe19116a5e1b3596cd0706c543/diffusion_tf/diffusion_utils_2.py#L42
-
-    :param betas: a 1-D numpy array of betas for each diffusion timestep,
-                  starting at T and going to 1.
-    :param model_mean_type: a ModelMeanType determining what the model outputs.
-    :param model_var_type: a ModelVarTypeDDPM determining how variance is output.
-    :param loss_type: a LossType determining the loss function to use.
-    :param rescale_timesteps: if True, pass floating point timesteps into the
-                              model so that they are always scaled like in the
-                              original paper (0 to 1000).
-    """
-
-    def __init__(
-        self,
-        *,
-        betas,
-        model_mean_type,
-        model_var_type,
-        scale_factor=None,
-        sf=4,
-    ):
-        self.model_mean_type = model_mean_type        # EPSILON
-        self.model_var_type = model_var_type          # LEARNED_RANGE
-        self.scale_factor = scale_factor   # scale factor in latent space default True
-        self.sf=sf
-
-        # Use float64 for accuracy.
-        betas = np.array(betas, dtype=np.float64)
-        self.betas = betas
-        assert len(betas.shape) == 1, "betas must be 1-D"
-        assert (betas > 0).all() and (betas <= 1).all()
-
-        self.num_timesteps = int(betas.shape[0])
-
-        alphas = 1.0 - betas
-        self.alphas_cumprod = np.cumprod(alphas, axis=0)
-        self.alphas_cumprod_prev = np.append(1.0, self.alphas_cumprod[:-1])
-        self.alphas_cumprod_next = np.append(self.alphas_cumprod[1:], 0.0)
-        assert self.alphas_cumprod_prev.shape == (self.num_timesteps,)
-
-        # calculations for diffusion q(x_t | x_{t-1}) and others
-        self.sqrt_alphas_cumprod = np.sqrt(self.alphas_cumprod)
-        self.sqrt_one_minus_alphas_cumprod = np.sqrt(1.0 - self.alphas_cumprod)
-        self.log_one_minus_alphas_cumprod = np.log(1.0 - self.alphas_cumprod)
-        self.sqrt_recip_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod)
-        self.sqrt_recipm1_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod - 1)
-
-        # calculations for posterior q(x_{t-1} | x_t, x_0)
-        self.posterior_variance = (
-            betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
-        )
-        # log calculation clipped because the posterior variance is 0 at the
-        # beginning of the diffusion chain.
-        self.posterior_log_variance_clipped = np.log(
-            np.append(self.posterior_variance[1], self.posterior_variance[1:])
-        )
-        self.posterior_mean_coef1 = (
-            betas * np.sqrt(self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
-        )
-        self.posterior_mean_coef2 = (
-            (1.0 - self.alphas_cumprod_prev)
-            * np.sqrt(alphas)
-            / (1.0 - self.alphas_cumprod)
-        )
-
-    def q_mean_variance(self, x_start, t):
-        """
-        Get the distribution q(x_t | x_0).
-
-        :param x_start: the [N x C x ...] tensor of noiseless inputs.
-        :param t: the number of diffusion steps (minus 1). Here, 0 means one step.
-        :return: A tuple (mean, variance, log_variance), all of x_start's shape.
-        """
-        mean = (
-            _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
-        )
-        variance = _extract_into_tensor(1.0 - self.alphas_cumprod, t, x_start.shape)
-        log_variance = _extract_into_tensor(
-            self.log_one_minus_alphas_cumprod, t, x_start.shape
-        )
-        return mean, variance, log_variance
-
-    def q_sample(self, x_start, t, noise=None):
-        """
-        Diffuse the data for a given number of diffusion steps.
-
-        In other words, sample from q(x_t | x_0).
-
-        :param x_start: the initial data batch.
-        :param t: the number of diffusion steps (minus 1). Here, 0 means one step.
-        :param noise: if specified, the split-out normal noise.
-        :return: A noisy version of x_start.
-        """
-        if noise is None:
-            noise = th.randn_like(x_start)
-        assert noise.shape == x_start.shape
-        return (
-            _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
-            + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
-            * noise
-        )
-
-    def q_posterior_mean_variance(self, x_start, x_t, t):
-        """
-        Compute the mean and variance of the diffusion posterior:
-
-            q(x_{t-1} | x_t, x_0)
-
-        """
-        assert x_start.shape == x_t.shape
-        posterior_mean = (
-            _extract_into_tensor(self.posterior_mean_coef1, t, x_t.shape) * x_start
-            + _extract_into_tensor(self.posterior_mean_coef2, t, x_t.shape) * x_t
-        )
-        posterior_variance = _extract_into_tensor(self.posterior_variance, t, x_t.shape)
-        posterior_log_variance_clipped = _extract_into_tensor(
-            self.posterior_log_variance_clipped, t, x_t.shape
-        )
-        assert (
-            posterior_mean.shape[0]
-            == posterior_variance.shape[0]
-            == posterior_log_variance_clipped.shape[0]
-            == x_start.shape[0]
-        )
-        return posterior_mean, posterior_variance, posterior_log_variance_clipped
-
-    def p_mean_variance(
-        self, model, x, t, clip_denoised=True, denoised_fn=None, model_kwargs=None
-    ):
-        """
-        Apply the model to get p(x_{t-1} | x_t), as well as a prediction of
-        the initial x, x_0.
-
-        :param model: the model, which takes a signal and a batch of timesteps
-                      as input.
-        :param x: the [N x C x ...] tensor at time t.
-        :param t: a 1-D Tensor of timesteps.
-        :param clip_denoised: if True, clip the denoised signal into [-1, 1].
-        :param denoised_fn: if not None, a function which applies to the
-            x_start prediction before it is used to sample. Applies before
-            clip_denoised.
-        :param model_kwargs: if not None, a dict of extra keyword arguments to
-            pass to the model. This can be used for conditioning.
-        :return: a dict with the following keys:
-                 - 'mean': the model mean output.
-                 - 'variance': the model variance output.
-                 - 'log_variance': the log of 'variance'.
-                 - 'pred_xstart': the prediction for x_0.
-        """
-        if model_kwargs is None:
-            model_kwargs = {}
-
-        B, C = x.shape[:2]
-        assert t.shape == (B,)
-        model_output = model(x, t, **model_kwargs)
-
-        if self.model_var_type in [ModelVarTypeDDPM.LEARNED, ModelVarTypeDDPM.LEARNED_RANGE]:
-            assert model_output.shape == (B, C * 2, *x.shape[2:])
-            model_output, model_var_values = th.split(model_output, C, dim=1)
-            if self.model_var_type == ModelVarTypeDDPM.LEARNED:
-                model_log_variance = model_var_values
-                model_variance = th.exp(model_log_variance)
-            else:
-                min_log = _extract_into_tensor(
-                    self.posterior_log_variance_clipped, t, x.shape
-                )
-                max_log = _extract_into_tensor(np.log(self.betas), t, x.shape)
-                # The model_var_values is [-1, 1] for [min_var, max_var].
-                frac = (model_var_values + 1) / 2
-                model_log_variance = frac * max_log + (1 - frac) * min_log
-                model_variance = th.exp(model_log_variance)
-        else:
-            model_variance, model_log_variance = {
-                # for fixedlarge, we set the initial (log-)variance like so
-                # to get a better decoder log likelihood.
-                ModelVarTypeDDPM.FIXED_LARGE: (
-                    np.append(self.posterior_variance[1], self.betas[1:]),
-                    np.log(np.append(self.posterior_variance[1], self.betas[1:])),
-                ),
-                ModelVarTypeDDPM.FIXED_SMALL: (
-                    self.posterior_variance,
-                    self.posterior_log_variance_clipped,
-                ),
-            }[self.model_var_type]
-            model_variance = _extract_into_tensor(model_variance, t, x.shape)
-            model_log_variance = _extract_into_tensor(model_log_variance, t, x.shape)
-
-        def process_xstart(x):
-            if denoised_fn is not None:
-                x = denoised_fn(x)
-            if clip_denoised:
-                return x.clamp(-1, 1)
-            return x
-
-        if self.model_mean_type == ModelMeanType.PREVIOUS_X:       # predict x_{t-1}
-            pred_xstart = process_xstart(
-                self._predict_xstart_from_xprev(x_t=x, t=t, xprev=model_output)
-            )
-            model_mean = model_output
-        elif self.model_mean_type in [ModelMeanType.START_X, ModelMeanType.EPSILON]:
-            if self.model_mean_type == ModelMeanType.START_X:      # predict x_0
-                pred_xstart = process_xstart(model_output)
-            else:
-                pred_xstart = process_xstart(
-                    self._predict_xstart_from_eps(x_t=x, t=t, eps=model_output)
-                )                                                  #  predict \eps
-            model_mean, _, _ = self.q_posterior_mean_variance(
-                x_start=pred_xstart, x_t=x, t=t
-            )
-        else:
-            raise NotImplementedError(self.model_mean_type)
-
-        assert (
-            model_mean.shape == model_log_variance.shape == pred_xstart.shape == x.shape
-        )
-        return {
-            "mean": model_mean,
-            "variance": model_variance,
-            "log_variance": model_log_variance,
-            "pred_xstart": pred_xstart,
-        }
-
-    def _predict_xstart_from_eps(self, x_t, t, eps):
-        assert x_t.shape == eps.shape
-        return (
-            _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
-            - _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * eps
-        )
-
-    def _predict_xstart_from_xprev(self, x_t, t, xprev):
-        assert x_t.shape == xprev.shape
-        return (  # (xprev - coef2*x_t) / coef1
-            _extract_into_tensor(1.0 / self.posterior_mean_coef1, t, x_t.shape) * xprev
-            - _extract_into_tensor(
-                self.posterior_mean_coef2 / self.posterior_mean_coef1, t, x_t.shape
-            )
-            * x_t
-        )
-
-    def _predict_eps_from_xstart(self, x_t, t, pred_xstart):
-        return (
-            _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
-            - pred_xstart
-        ) / _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
-
-    def p_sample(
-        self, model, x, t, clip_denoised=True, denoised_fn=None, model_kwargs=None
-    ):
-        """
-        Sample x_{t-1} from the model at the given timestep.
-
-        :param model: the model to sample from.
-        :param x: the current tensor at x_{t-1}.
-        :param t: the value of t, starting at 0 for the first diffusion step.
-        :param clip_denoised: if True, clip the x_start prediction to [-1, 1].
-        :param denoised_fn: if not None, a function which applies to the
-            x_start prediction before it is used to sample.
-        :param model_kwargs: if not None, a dict of extra keyword arguments to
-            pass to the model. This can be used for conditioning.
-        :return: a dict containing the following keys:
-                 - 'sample': a random sample from the model.
-                 - 'pred_xstart': a prediction of x_0.
-        """
-        out = self.p_mean_variance(
-            model,
-            x,
-            t,
-            clip_denoised=clip_denoised,
-            denoised_fn=denoised_fn,
-            model_kwargs=model_kwargs,
-        )
-        noise = th.randn_like(x)
-        nonzero_mask = (
-            (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
-        )  # no noise when t == 0
-        sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
-        return {"sample": sample, "pred_xstart": out["pred_xstart"]}
-
-    def p_sample_loop(
-        self,
-        model,
-        shape,
-        noise=None,
-        clip_denoised=True,
-        denoised_fn=None,
-        first_stage_model=None,
-        model_kwargs=None,
-        device=None,
-        progress=False,
-    ):
-        """
-        Generate samples from the model.
-
-        :param model: the model module.
-        :param shape: the shape of the samples, (N, C, H, W).
-        :param noise: if specified, the noise from the encoder to sample.
-                      Should be of the same shape as `shape`.
-        :param clip_denoised: if True, clip x_start predictions to [-1, 1].
-        :param denoised_fn: if not None, a function which applies to the
-            x_start prediction before it is used to sample.
-        :param model_kwargs: if not None, a dict of extra keyword arguments to
-            pass to the model. This can be used for conditioning.
-        :param device: if specified, the device to create the samples on.
-                       If not specified, use a model parameter's device.
-        :param progress: if True, show a tqdm progress bar.
-        :return: a non-differentiable batch of samples.
-        """
-        final = None
-        for sample in self.p_sample_loop_progressive(
-            model,
-            shape,
-            noise=noise,
-            clip_denoised=clip_denoised,
-            denoised_fn=denoised_fn,
-            model_kwargs=model_kwargs,
-            device=device,
-            progress=progress,
-        ):
-            final = sample
-        return self.decode_first_stage(final["sample"], first_stage_model)
-
-    def p_sample_loop_progressive(
-        self,
-        model,
-        shape,
-        noise=None,
-        clip_denoised=True,
-        denoised_fn=None,
-        model_kwargs=None,
-        device=None,
-        progress=False,
-    ):
-        """
-        Generate samples from the model and yield intermediate samples from
-        each timestep of diffusion.
-
-        Arguments are the same as p_sample_loop().
-        Returns a generator over dicts, where each dict is the return value of
-        p_sample().
-        """
-        if device is None:
-            device = next(model.parameters()).device
-        assert isinstance(shape, (tuple, list))
-        if noise is not None:
-            img = noise
-        else:
-            img = th.randn(*shape, device=device)
-        indices = list(range(self.num_timesteps))[::-1]
-
-        if progress:
-            # Lazy import so that we don't depend on tqdm.
-            from tqdm.auto import tqdm
-
-            indices = tqdm(indices)
-
-        for i in indices:
-            t = th.tensor([i] * shape[0], device=device)
-            with th.no_grad():
-                out = self.p_sample(
-                    model,
-                    img,
-                    t,
-                    clip_denoised=clip_denoised,
-                    denoised_fn=denoised_fn,
-                    model_kwargs=model_kwargs,
-                )
-                yield out
-                img = out["sample"]
-
-    def ddim_sample(
-        self,
-        model,
-        x,
-        t,
-        clip_denoised=True,
-        denoised_fn=None,
-        model_kwargs=None,
-        eta=0.0,
-    ):
-        """
-        Sample x_{t-1} from the model using DDIM.
-
-        Same usage as p_sample().
-        """
-        out = self.p_mean_variance(
-            model,
-            x,
-            t,
-            clip_denoised=clip_denoised,
-            denoised_fn=denoised_fn,
-            model_kwargs=model_kwargs,
-        )
-        # Usually our model outputs epsilon, but we re-derive it
-        # in case we used x_start or x_prev prediction.
-        eps = self._predict_eps_from_xstart(x, t, out["pred_xstart"])
-        alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x.shape)
-        alpha_bar_prev = _extract_into_tensor(self.alphas_cumprod_prev, t, x.shape)
-        sigma = (
-            eta
-            * th.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar))
-            * th.sqrt(1 - alpha_bar / alpha_bar_prev)
-        )
-        # Equation 12.
-        noise = th.randn_like(x)
-        mean_pred = (
-            out["pred_xstart"] * th.sqrt(alpha_bar_prev)
-            + th.sqrt(1 - alpha_bar_prev - sigma ** 2) * eps
-        )
-        nonzero_mask = (
-            (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
-        )  # no noise when t == 0
-        sample = mean_pred + nonzero_mask * sigma * noise
-        return {"sample": sample, "pred_xstart": out["pred_xstart"]}
-
-    def ddim_reverse_sample(
-        self,
-        model,
-        x,
-        t,
-        clip_denoised=True,
-        denoised_fn=None,
-        model_kwargs=None,
-        eta=0.0,
-    ):
-        """
-        Sample x_{t+1} from the model using DDIM reverse ODE.
-        """
-        assert eta == 0.0, "Reverse ODE only for deterministic path"
-        out = self.p_mean_variance(
-            model,
-            x,
-            t,
-            clip_denoised=clip_denoised,
-            denoised_fn=denoised_fn,
-            model_kwargs=model_kwargs,
-        )
-        # Usually our model outputs epsilon, but we re-derive it
-        # in case we used x_start or x_prev prediction.
-        eps = (
-            _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x.shape) * x
-            - out["pred_xstart"]
-        ) / _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x.shape)
-        alpha_bar_next = _extract_into_tensor(self.alphas_cumprod_next, t, x.shape)
-
-        # Equation 12. reversed
-        mean_pred = (
-            out["pred_xstart"] * th.sqrt(alpha_bar_next)
-            + th.sqrt(1 - alpha_bar_next) * eps
-        )
-
-        return {"sample": mean_pred, "pred_xstart": out["pred_xstart"]}
-
-    def ddim_sample_loop(
-        self,
-        model,
-        shape,
-        noise=None,
-        first_stage_model=None,
-        clip_denoised=True,
-        denoised_fn=None,
-        model_kwargs=None,
-        device=None,
-        progress=False,
-        eta=0.0,
-    ):
-        """
-        Generate samples from the model using DDIM.
-
-        Same usage as p_sample_loop().
-        """
-        final = None
-        for sample in self.ddim_sample_loop_progressive(
-            model,
-            shape,
-            noise=noise,
-            clip_denoised=clip_denoised,
-            denoised_fn=denoised_fn,
-            model_kwargs=model_kwargs,
-            device=device,
-            progress=progress,
-            eta=eta,
-        ):
-            final = sample
-        return self.decode_first_stage(final["sample"], first_stage_model)
-
-    def ddim_sample_loop_progressive(
-        self,
-        model,
-        shape,
-        noise=None,
-        clip_denoised=True,
-        denoised_fn=None,
-        model_kwargs=None,
-        device=None,
-        progress=False,
-        eta=0.0,
-    ):
-        """
-        Use DDIM to sample from the model and yield intermediate samples from
-        each timestep of DDIM.
-
-        Same usage as p_sample_loop_progressive().
-        """
-        if device is None:
-            device = next(model.parameters()).device
-        assert isinstance(shape, (tuple, list))
-        if noise is not None:
-            img = noise
-        else:
-            img = th.randn(*shape, device=device)
-        indices = list(range(self.num_timesteps))[::-1]
-
-        if progress:
-            # Lazy import so that we don't depend on tqdm.
-            from tqdm.auto import tqdm
-
-            indices = tqdm(indices)
-
-        for i in indices:
-            t = th.tensor([i] * shape[0], device=device).long()
-            with th.no_grad():
-                out = self.ddim_sample(
-                    model,
-                    img,
-                    t,
-                    clip_denoised=clip_denoised,
-                    denoised_fn=denoised_fn,
-                    model_kwargs=model_kwargs,
-                    eta=eta,
-                )
-                yield out
-                img = out["sample"]
-
-    def training_losses(self, model, x_start, t, first_stage_model=None, model_kwargs=None, noise=None):
-        """
-        Compute training losses for a single timestep.
-
-        :param model: the model to evaluate loss on.
-        :param x_start: the [N x C x ...] tensor of inputs.
-        :param t: a batch of timestep indices.
-        :param model_kwargs: if not None, a dict of extra keyword arguments to
-            pass to the model. This can be used for conditioning.
-        :param noise: if specified, the specific Gaussian noise to try to remove.
-        :return: a dict with the key "loss" containing a tensor of shape [N].
-                 Some mean or variance settings may also have other keys.
-        """
-        if model_kwargs is None:
-            model_kwargs = {}
-
-        z_start = self.encode_first_stage(x_start, first_stage_model)
-        if noise is None:
-            noise = th.randn_like(z_start)
-        z_t = self.q_sample(z_start, t, noise=noise)
-
-        terms = {}
-
-        model_output = model(z_t, t, **model_kwargs)
-
-        target = {
-            ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
-                x_start=z_start, x_t=z_t, t=t
-            )[0],
-            ModelMeanType.START_X: z_start,
-            ModelMeanType.EPSILON: noise,
-        }[self.model_mean_type]
-        assert model_output.shape == target.shape == z_start.shape
-        terms["mse"] = mean_flat((target - model_output) ** 2)
-        terms["loss"] = terms["mse"]
-
-        if self.model_mean_type == ModelMeanType.START_X:      # predict x_0
-            pred_zstart = model_output.detach()
-        elif self.model_mean_type == ModelMeanType.EPSILON:
-            pred_zstart = self._predict_xstart_from_eps(x_t=z_t, t=t, eps=model_output.detach())
-        else:
-            raise NotImplementedError(self.model_mean_type)
-
-        return terms, z_t, pred_zstart
-
-    def _prior_bpd(self, x_start):
-        """
-        Get the prior KL term for the variational lower-bound, measured in
-        bits-per-dim.
-
-        This term can't be optimized, as it only depends on the encoder.
-
-        :param x_start: the [N x C x ...] tensor of inputs.
-        :return: a batch of [N] KL values (in bits), one per batch element.
-        """
-        batch_size = x_start.shape[0]
-        t = th.tensor([self.num_timesteps - 1] * batch_size, device=x_start.device)
-        qt_mean, _, qt_log_variance = self.q_mean_variance(x_start, t)   # q(x_t|x_0)
-        kl_prior = normal_kl(
-            mean1=qt_mean, logvar1=qt_log_variance, mean2=0.0, logvar2=0.0
-        )
-        return mean_flat(kl_prior) / np.log(2.0)
-
-
-    def _scale_input(self, inputs, t):
-        return inputs
-
-    def decode_first_stage(self, z_sample, first_stage_model=None):
-        ori_dtype = z_sample.dtype
-        if first_stage_model is None:
-            return z_sample
-        else:
-            with th.no_grad():
-                z_sample = 1 / self.scale_factor * z_sample
-                z_sample = z_sample.type(next(first_stage_model.parameters()).dtype)
-                out = first_stage_model.decode(z_sample)
-                return out.type(ori_dtype)
-
-    def encode_first_stage(self, y, first_stage_model, up_sample=False):
-        ori_dtype = y.dtype
-        if up_sample:
-            y = F.interpolate(y, scale_factor=self.sf, mode='bicubic')
-        if first_stage_model is None:
-            return y
-        else:
-            with th.no_grad():
-                y = y.type(dtype=next(first_stage_model.parameters()).dtype)
-                z_y = first_stage_model.encode(y)
-                out = z_y * self.scale_factor
-                return out.type(ori_dtype)
