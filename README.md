@@ -11,6 +11,12 @@ conda install pytorch==1.10.1 torchvision==0.11.2 cudatoolkit=11.1 -c pytorch -y
 pip install -r requirements.txt
 ```
 
+## Download ckeckpoint.
+Download the checkpoint file, the move them to './ckpt' folder.![融合结果](https://drive.google.com/file/d/1x0xznXFFw94_-EINN0TdTI2ZDyxsbNNW/view?usp=drive_link)
+
+
+
+
 ## Visualize Input W and Input T
 <p align="center">
   <img src="https://raw.githubusercontent.com/cxld5235252-arch/LAFusion/main/data/284_wide.png" alt="Figure 1" width="45%" style="display:inline-block; margin-right:10px;">
@@ -37,4 +43,4 @@ python /data/cxl/cxl_oppo/github/LGSR/merge_tile.py
 <p align="center">
   <img src="https://raw.githubusercontent.com/cxld5235252-arch/LAFusion/main/result/284_wide.png" alt="Figure 3" style="display:inline-block; margin-right:10px;">
 
-<p align="center"><b>Fusion Result.</b></p>
+<p align="center"><b>Figure2: Fusion Result.</b></p>
