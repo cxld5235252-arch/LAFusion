@@ -12,7 +12,7 @@ pip install -r requirements.txt
 ```
 
 ## Download ckeckpoint.
-Download the checkpoint file, the move them to './ckpt' folder.![融合结果](https://drive.google.com/file/d/1x0xznXFFw94_-EINN0TdTI2ZDyxsbNNW/view?usp=sharing)
+Download the checkpoint file, the move them to './ckpt' folder.[VQVAE](https://drive.google.com/file/d/1x0xznXFFw94_-EINN0TdTI2ZDyxsbNNW/view?usp=sharing)
 
 
 
